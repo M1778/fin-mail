@@ -1,0 +1,27 @@
+// Basic fin-mail example: build a message and print the rendered MIME.
+// No network involved. Run: finc -I src examples/basic.fin -o example_basic
+//   && ./example_basic
+import { MailMessage, MailRender, mail_new, mail_free,
+         mail_set_from, mail_add_to, mail_add_cc,
+         mail_set_subject, mail_set_text, mail_set_html, mail_attach,
+         mail_render, mail_free_render } from mail::fin;
+import { free_str } from strings::std;
+
+fun main() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_add_cc(m, "cc@example.com");
+    mail_set_subject(m, "Hello from fin-mail");
+    mail_set_text(m, "Hello,\nthis is a plain-text body.");
+    mail_set_html(m, "<p>Hello,</p><p>this is an <b>HTML</b> body.</p>");
+    mail_attach(m, "notes.txt", "text/plain", "Hello, attachment!");
+    let r <MailRender> = mail_render(m);
+    if (r.ok) {
+        printf("%s", r.text);
+    } else {
+        printf("RENDER FAILED: %s\n", r.err);
+    }
+    mail_free_render(&r);
+    mail_free(m);
+}

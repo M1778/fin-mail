@@ -1,0 +1,27 @@
+// Sends a test message to a LOCAL SMTP sink (default 127.0.0.1:11025).
+// Start the sink first: python3 tests/smtp_sink.py --port 11025 --out /tmp/sink.json
+// No real mail, no real credentials, localhost only.
+// Run: finc -I src examples/send_local.fin -o example_send_local && ./example_send_local
+import { MailMessage, MailResult, mail_new, mail_free,
+         mail_set_from, mail_add_to, mail_add_cc, mail_add_bcc,
+         mail_set_subject, mail_set_text, mail_attach,
+         mail_send, mail_free_result } from mail::fin;
+
+fun main() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_add_cc(m, "cc@example.com");
+    mail_add_bcc(m, "hidden@example.com");
+    mail_set_subject(m, "Local sink test");
+    mail_set_text(m, "Hello from fin-mail.\n.dotline should arrive dot-stuffed.\nBye.");
+    mail_attach(m, "notes.txt", "text/plain", "Hello, attachment!");
+    let res <MailResult> = mail_send("127.0.0.1", 11025, m);
+    if (res.ok) {
+        printf("SEND OK code=%d\n", res.code);
+    } else {
+        printf("SEND FAIL code=%d err=%s\n", res.code, res.err);
+    }
+    mail_free_result(&res);
+    mail_free(m);
+}

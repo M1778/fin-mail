@@ -1,0 +1,5 @@
+// Export symbols from the main library file.
+// NOTE: Fin has no `export *` syntax yet (finn's init template generates
+// it, finc cannot parse it) — this file is documentation only; CI does
+// not run finc on it. Consumers import directly:
+//   import { mail_send, mail_render } from mail::fin;

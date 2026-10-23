@@ -1,0 +1,27 @@
+// Sends a test message with AUTH LOGIN to a LOCAL SMTP sink
+// (default 127.0.0.1:11026). The credentials below are test-only values
+// for the local sink — never real credentials, localhost only.
+// Start the sink first:
+//   python3 tests/smtp_sink.py --port 11026 --out /tmp/sink_auth.json \
+//     --auth-user user --auth-pass pass
+// Run: finc -I src examples/send_local_auth.fin -o example_send_auth && ./example_send_auth
+import { MailMessage, MailResult, mail_new, mail_free,
+         mail_set_from, mail_add_to,
+         mail_set_subject, mail_set_text,
+         mail_send_auth, mail_free_result } from mail::fin;
+
+fun main() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "Local sink auth test");
+    mail_set_text(m, "Authenticated hello.");
+    let res <MailResult> = mail_send_auth("127.0.0.1", 11026, "user", "pass", m);
+    if (res.ok) {
+        printf("SEND OK code=%d\n", res.code);
+    } else {
+        printf("SEND FAIL code=%d err=%s\n", res.code, res.err);
+    }
+    mail_free_result(&res);
+    mail_free(m);
+}

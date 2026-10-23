@@ -1,0 +1,202 @@
+// Tests for fin-mail.
+// Run: finc -I src tests/test_mail.fin -o test_mail && ./test_mail
+// Every assert_* blames (aborts, non-zero exit) on failure; a clean run
+// printing ALL TESTS PASSED means every check below passed.
+// NOTE: test_send_failure dials 127.0.0.1:59997 and expects refusal; the
+// live driver (tests/live_smtp.py) verifies that port is free first.
+import { MailMessage, MailRender, MailResult, mail_new, mail_free,
+         mail_set_from, mail_add_to, mail_add_cc, mail_add_bcc,
+         mail_set_subject, mail_set_text, mail_set_html, mail_attach,
+         mail_valid_address, mail_render, mail_free_render,
+         mail_send, mail_free_result, mail_version } from mail::fin;
+import { assert_true, assert_false,
+         assert_eq_string } from testing::std;
+import { len, contains, free_str } from strings::std;
+
+fun test_version() <noret> {
+    let v <string> = mail_version();
+    assert_eq_string(v, "0.1.0", "version: 0.1.0");
+    free_str(v);
+}
+
+fun test_addresses() <noret> {
+    assert_true(mail_valid_address("a@b.com"), "addr: simple valid");
+    assert_true(mail_valid_address("first.last@mail.example.org"), "addr: dotted valid");
+    assert_true(mail_valid_address("u+tag@sub.domain.co"), "addr: plus tag valid");
+    assert_false(mail_valid_address(""), "addr: empty invalid");
+    assert_false(mail_valid_address("plain"), "addr: no at invalid");
+    assert_false(mail_valid_address("@b.com"), "addr: empty local invalid");
+    assert_false(mail_valid_address("a@"), "addr: empty domain invalid");
+    assert_false(mail_valid_address("a@b"), "addr: domain without dot invalid");
+    assert_false(mail_valid_address("a@.com"), "addr: dot-first domain invalid");
+    assert_false(mail_valid_address("a@b."), "addr: dot-last domain invalid");
+    assert_false(mail_valid_address("a@b@c.com"), "addr: two ats invalid");
+    assert_false(mail_valid_address("a b@c.com"), "addr: space invalid");
+    assert_false(mail_valid_address("a@b .com"), "addr: space in domain invalid");
+    assert_false(mail_valid_address("a@b.com\r\nBcc: x@y.com"), "addr: CRLF injection invalid");
+}
+
+fun test_render_text() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "Hello");
+    mail_set_text(m, "line one\nline two\r\nline three\rlast");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "text: renders ok");
+    assert_true(contains(r.text, "From: sender@example.com\r\n"), "text: From header");
+    assert_true(contains(r.text, "To: rcpt@example.com\r\n"), "text: To header");
+    assert_true(contains(r.text, "Subject: Hello\r\n"), "text: Subject header");
+    assert_true(contains(r.text, "MIME-Version: 1.0\r\n"), "text: MIME header");
+    assert_true(contains(r.text, "Content-Type: text/plain; charset=utf-8\r\n"), "text: content type");
+    assert_false(contains(r.text, "multipart"), "text: no multipart markers");
+    assert_true(contains(r.text, "line one\r\nline two\r\nline three\r\nlast"), "text: all endings normalized to CRLF");
+    assert_false(contains(r.text, "\r\r\n"), "text: no doubled CR");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_multi_recipient_bcc() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "one@example.com");
+    mail_add_to(m, "two@example.com");
+    mail_add_cc(m, "cc@example.com");
+    mail_add_bcc(m, "hidden@example.com");
+    mail_set_subject(m, "Many");
+    mail_set_text(m, "hi");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "multi: renders ok");
+    assert_true(contains(r.text, "To: one@example.com, two@example.com\r\n"), "multi: To joined");
+    assert_true(contains(r.text, "Cc: cc@example.com\r\n"), "multi: Cc header");
+    assert_false(contains(r.text, "hidden@example.com"), "multi: Bcc address never in headers");
+    assert_false(contains(r.text, "Bcc:"), "multi: no Bcc header at all");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_html() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "HTML mail");
+    mail_set_text(m, "plain version");
+    mail_set_html(m, "<p>html version</p>");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "html: renders ok");
+    assert_true(contains(r.text, "multipart/alternative"), "html: alternative marker");
+    assert_true(contains(r.text, "plain version"), "html: text part present");
+    assert_true(contains(r.text, "<p>html version</p>"), "html: html part present");
+    assert_true(contains(r.text, "Content-Type: text/html; charset=utf-8"), "html: html part type");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_attach() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "With file");
+    mail_set_text(m, "see attached");
+    mail_attach(m, "notes.txt", "text/plain", "Hello, attachment!");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "att: renders ok");
+    assert_true(contains(r.text, "multipart/mixed"), "att: mixed marker");
+    assert_true(contains(r.text, "SGVsbG8sIGF0dGFjaG1lbnQh"), "att: base64 body");
+    assert_true(contains(r.text, "filename=\"notes.txt\""), "att: filename present");
+    assert_true(contains(r.text, "Content-Transfer-Encoding: base64"), "att: base64 header");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_attach_wrap() <noret> {
+    // 60 a's -> 80 base64 chars -> must wrap at 76 columns.
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "Long att");
+    mail_set_text(m, "x");
+    mail_attach(m, "long.txt", "text/plain", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "wrap: renders ok");
+    assert_true(contains(r.text, "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\r\nYWFh"), "wrap: base64 wrapped at 76 columns");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_attach_html() <noret> {
+    // HTML + attachment = nested multipart (mixed outer, alternative inner).
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_subject(m, "Both");
+    mail_set_text(m, "plain");
+    mail_set_html(m, "<b>rich</b>");
+    mail_attach(m, "a.txt", "text/plain", "data");
+    let r <MailRender> = mail_render(m);
+    assert_true(r.ok, "nested: renders ok");
+    assert_true(contains(r.text, "multipart/mixed"), "nested: mixed outer");
+    assert_true(contains(r.text, "multipart/alternative"), "nested: alternative inner");
+    assert_true(contains(r.text, "<b>rich</b>"), "nested: html present");
+    mail_free_render(&r);
+    mail_free(m);
+}
+
+fun test_render_errors() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_text(m, "hi");
+    let r <MailRender> = mail_render(m);
+    assert_false(r.ok, "err: missing From fails");
+    assert_true(len(r.err) > 0, "err: missing From has message");
+    mail_free_render(&r);
+    mail_set_from(m, "sender@example.com");
+    // Drop the only recipient by using a fresh message instead.
+    mail_free(m);
+    let m2 <&MailMessage> = mail_new();
+    mail_set_from(m2, "sender@example.com");
+    mail_set_text(m2, "hi");
+    let r2 <MailRender> = mail_render(m2);
+    assert_false(r2.ok, "err: no recipients fails");
+    mail_free_render(&r2);
+    mail_add_to(m2, "not-an-address");
+    let r3 <MailRender> = mail_render(m2);
+    assert_false(r3.ok, "err: bad To fails");
+    mail_free_render(&r3);
+    mail_free(m2);
+    let m3 <&MailMessage> = mail_new();
+    mail_set_from(m3, "sender@example.com");
+    mail_add_to(m3, "rcpt@example.com");
+    mail_set_subject(m3, "bad\r\nSubject: injected");
+    mail_set_text(m3, "hi");
+    let r4 <MailRender> = mail_render(m3);
+    assert_false(r4.ok, "err: CRLF subject rejected");
+    mail_free_render(&r4);
+    mail_free(m3);
+}
+
+fun test_send_failure() <noret> {
+    let m <&MailMessage> = mail_new();
+    mail_set_from(m, "sender@example.com");
+    mail_add_to(m, "rcpt@example.com");
+    mail_set_text(m, "hi");
+    let res <MailResult> = mail_send("127.0.0.1", 59997, m);
+    assert_false(res.ok, "sendfail: refused port is not ok");
+    assert_true(len(res.err) > 0, "sendfail: error message present");
+    mail_free_result(&res);
+    mail_free(m);
+}
+
+fun main() <noret> {
+    test_version();
+    test_addresses();
+    test_render_text();
+    test_render_multi_recipient_bcc();
+    test_render_html();
+    test_render_attach();
+    test_render_attach_wrap();
+    test_render_attach_html();
+    test_render_errors();
+    test_send_failure();
+    printf("ALL TESTS PASSED\n");
+}

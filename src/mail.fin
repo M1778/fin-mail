@@ -1,0 +1,820 @@
+// fin-mail — SMTP client library + MIME message builder for Fin.
+//
+// Sends mail through any plain (non-TLS) SMTP server and builds RFC 5322 /
+// MIME messages: plain text, HTML (multipart/alternative), and text
+// attachments (base64, multipart/mixed). Transport is raw blocking TCP
+// over IPv4, mirroring zhttp's design: dotted-quad hosts only, no DNS,
+// `blame` only for programmer errors, explicit error values for I/O and
+// protocol failures.
+//
+// Security notes, stated plainly:
+//   - v0.1.0 has NO TLS. Use it against localhost test sinks and trusted
+//     LAN relays only. AUTH LOGIN sends base64 credentials, which is
+//     effectively plaintext — never use it over the public internet.
+//   - Attachments are TEXT only in v0.1.0: std `base64_encode` is
+//     strlen-based and cannot encode binary data. Binary attachments are
+//     future work (needs a byte-safe base64 path).
+//   - No Date or Message-ID header is generated; the submitting server
+//     adds them. Address validation is syntactic only.
+//
+// Why the socket layer is vendored here instead of imported from
+// networking::std: only `#[global]` externs lower through a module import,
+// and networking.fin's `c_*` externs are not `#[global]` (same reason
+// zhttp vendors its own layer). The @defines below carry the exact same
+// C ABI as networking.fin's.
+//
+// Ownership (read before freeing anything):
+//   - Setters clone their inputs: callers may free their strings after.
+//   - `mail_render` returns a FRESH string on success; free it with
+//     `free_str` when done. On failure `text` is "" (do not free).
+//   - `MailResult.err` / `MailRender.err` are heap strings on failure
+//     only; free them with `mail_free_result` / `mail_free_render`.
+//   - `mail_free` frees every string the message owns, including
+//     recipient and attachment strings.
+
+import { Collection } from collection::std;
+import { len, equals, clone, concat, substr, find, contains, to_chars, from_chars, free_str, join, replace } from strings::std;
+import { base64_encode, free_encoded } from encoding::std;
+import { now } from time::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Local C bindings (module-private). Same ABI as networking::std / zhttp.
+// ---------------------------------------------------------------------------
+
+#[llvm_name="socket"]
+@define m_socket(domain: int, kind: int, protocol: int) <int>;
+
+#[llvm_name="connect"]
+@define m_connect(fd: int, addr: &int, len: int) <int>;
+
+#[llvm_name="send"]
+@define m_send(fd: int, buf: &char, len: int, flags: int) <int>;
+
+#[llvm_name="recv"]
+@define m_recv(fd: int, buf: &char, len: int, flags: int) <int>;
+
+#[llvm_name="close"]
+@define m_close(fd: int) <int>;
+
+#[llvm_name="inet_addr"]
+@define m_inet_addr(cp: string) <int>;
+
+#[llvm_name="calloc"]
+@define m_calloc(count: ulong, size: ulong) <string>;
+
+#[llvm_name="free"]
+@define m_cfree(p: string) <noret>;
+
+#[llvm_name="snprintf"]
+@define m_snprintf(buf: string, size: ulong, fmt: string, ...) <int>;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+#[export]
+pub struct MailMessage {
+    pub:
+        sender <string>,
+        to <&Collection<string>>,
+        cc <&Collection<string>>,
+        bcc <&Collection<string>>,
+        subject <string>,
+        text_body <string>,
+        html_body <string>,
+        att_names <&Collection<string>>,
+        att_types <&Collection<string>>,
+        att_contents <&Collection<string>>,
+}
+
+#[export]
+pub struct MailRender {
+    pub:
+        ok <bool>,
+        text <string>,
+        err <string>,
+}
+
+#[export]
+pub struct MailResult {
+    pub:
+        ok <bool>,
+        code <int>,
+        err <string>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal: growable byte buffer (same proven shape as zhttp's ZBuf)
+// ---------------------------------------------------------------------------
+
+struct MBuf {
+    data <[char]>,
+    len <int>,
+    cap <int>,
+}
+
+fun m_buf_new() <&MBuf> {
+    let cap <int> = 4096;
+    return new MBuf{data: new [char, cap]{}, len: 0, cap: cap};
+}
+
+fun m_buf_reserve(b: &MBuf, extra: int) <noret> {
+    if (b.len + extra <= b.cap) { return; }
+    let want <int> = b.cap * 2;
+    while (want < b.len + extra) { want = want * 2; }
+    let nd <[char]> = new [char, want]{};
+    for (let i <int> = 0; i < b.len; i++) { nd[i] = b.data[i]; }
+    delete b.data;
+    b.data = nd;
+    b.cap = want;
+}
+
+fun m_buf_push(b: &MBuf, c: char) <noret> {
+    m_buf_reserve(b, 1);
+    b.data[b.len] = c;
+    b.len = b.len + 1;
+}
+
+fun m_buf_append(b: &MBuf, bytes: [char], n: int) <noret> {
+    if (n <= 0) { return; }
+    m_buf_reserve(b, n);
+    for (let i <int> = 0; i < n; i++) { b.data[b.len + i] = bytes[i]; }
+    b.len = b.len + n;
+}
+
+fun m_buf_append_str(b: &MBuf, s: string) <noret> {
+    let m <int> = len(s);
+    if (m == 0) { return; }
+    m_buf_reserve(b, m);
+    let bytes <[char]> = to_chars(s);
+    for (let i <int> = 0; i < m; i++) { b.data[b.len + i] = bytes[i]; }
+    b.len = b.len + m;
+    delete bytes;
+}
+
+fun m_buf_to_string(b: &MBuf) <string> {
+    return from_chars(b.data, 0, b.len);
+}
+
+fun m_buf_free(b: &MBuf) <noret> {
+    delete b.data;
+    delete b;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: small helpers
+// ---------------------------------------------------------------------------
+
+fun m_itoa(v: int) <string> {
+    let tmp <string> = m_calloc(cast<ulong>(24), cast<ulong>(1));
+    m_snprintf(tmp, cast<ulong>(24), "%d", v);
+    let out <string> = clone(tmp);
+    m_cfree(tmp);
+    return out;
+}
+
+fun m_ltoa(v: long) <string> {
+    let tmp <string> = m_calloc(cast<ulong>(32), cast<ulong>(1));
+    m_snprintf(tmp, cast<ulong>(32), "%ld", v);
+    let out <string> = clone(tmp);
+    m_cfree(tmp);
+    return out;
+}
+
+fun m_is_digit(c: char) <bool> {
+    return c >= '0' && c <= '9';
+}
+
+// True when s contains no CR or LF (header-injection guard).
+fun m_no_crlf(s: string) <bool> {
+    return !contains(s, "\r") && !contains(s, "\n");
+}
+
+// Normalizes all line endings in s to CRLF: CRLF -> LF, lone CR -> LF,
+// then LF -> CRLF. Applied to text/html bodies before rendering.
+fun m_normalize_crlf(s: string) <string> {
+    let a <string> = replace(s, "\r\n", "\n");
+    let b <string> = replace(a, "\r", "\n");
+    free_str(a);
+    let c <string> = replace(b, "\n", "\r\n");
+    free_str(b);
+    return c;
+}
+
+// Wraps s at 76 columns with CRLF (RFC 2045 line limit for base64).
+fun m_wrap76(s: string) <string> {
+    let total <int> = len(s);
+    if (total <= 76) { return clone(s); }
+    let out <string> = clone("");
+    let pos <int> = 0;
+    while (pos < total) {
+        let chunk <int> = 76;
+        if (total - pos < chunk) { chunk = total - pos; }
+        let piece <string> = substr(s, pos, chunk);
+        let joined <string> = out;
+        if (pos == 0) {
+            joined = piece;
+            free_str(out);
+        } else {
+            let tmp <string> = concat(out, "\r\n");
+            joined = concat(tmp, piece);
+            free_str(tmp);
+            free_str(out);
+            free_str(piece);
+        }
+        out = joined;
+        pos = pos + chunk;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Address validation (syntactic only — cannot prove deliverability)
+// ---------------------------------------------------------------------------
+
+// Static string — do NOT free the result.
+#[export]
+pub fun mail_version() <string> {
+    return clone("0.1.0");
+}
+
+#[export]
+pub fun mail_valid_address(addr: string) <bool> {
+    if (!m_no_crlf(addr)) { return false; }
+    if (len(addr) == 0) { return false; }
+    if (contains(addr, " ") || contains(addr, "<") || contains(addr, ">") ||
+        contains(addr, ",") || contains(addr, ";") || contains(addr, ":")) {
+        return false;
+    }
+    let at <int> = find(addr, "@");
+    if (at <= 0) { return false; }
+    let rest <string> = substr(addr, at + 1, len(addr) - at - 1);
+    let at2 <int> = find(rest, "@");
+    free_str(rest);
+    if (at2 >= 0) { return false; }
+    if (at + 1 >= len(addr)) { return false; }
+    let domain <string> = substr(addr, at + 1, len(addr) - at - 1);
+    let dot <int> = find(domain, ".");
+    let ok <bool> = dot > 0 && dot < len(domain) - 1;
+    free_str(domain);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Message lifecycle
+// ---------------------------------------------------------------------------
+
+// Creates an empty message. Free with mail_free. All setters clone.
+#[export]
+pub fun mail_new() <&MailMessage> {
+    return new MailMessage{sender: clone(""),
+        to: new Collection::<string>{},
+        cc: new Collection::<string>{},
+        bcc: new Collection::<string>{},
+        subject: clone(""),
+        text_body: clone(""),
+        html_body: clone(""),
+        att_names: new Collection::<string>{},
+        att_types: new Collection::<string>{},
+        att_contents: new Collection::<string>{}};
+}
+
+fun m_free_str_list(c: &Collection<string>) <noret> {
+    let n <int> = c.len();
+    for (let i <int> = 0; i < n; i++) { free_str(c.get(i)); }
+    delete c;
+}
+
+#[export]
+pub fun mail_free(m: &MailMessage) <noret> {
+    if (m == null) { return; }
+    free_str(m.sender);
+    m_free_str_list(m.to);
+    m_free_str_list(m.cc);
+    m_free_str_list(m.bcc);
+    free_str(m.subject);
+    free_str(m.text_body);
+    free_str(m.html_body);
+    m_free_str_list(m.att_names);
+    m_free_str_list(m.att_types);
+    m_free_str_list(m.att_contents);
+    delete m;
+}
+
+#[export]
+pub fun mail_set_from(m: &MailMessage, addr: string) <noret> {
+    free_str(m.sender);
+    m.sender = clone(addr);
+}
+
+#[export]
+pub fun mail_add_to(m: &MailMessage, addr: string) <noret> {
+    m.to.push(clone(addr));
+}
+
+#[export]
+pub fun mail_add_cc(m: &MailMessage, addr: string) <noret> {
+    m.cc.push(clone(addr));
+}
+
+#[export]
+pub fun mail_add_bcc(m: &MailMessage, addr: string) <noret> {
+    m.bcc.push(clone(addr));
+}
+
+#[export]
+pub fun mail_set_subject(m: &MailMessage, s: string) <noret> {
+    free_str(m.subject);
+    m.subject = clone(s);
+}
+
+#[export]
+pub fun mail_set_text(m: &MailMessage, s: string) <noret> {
+    free_str(m.text_body);
+    m.text_body = clone(s);
+}
+
+#[export]
+pub fun mail_set_html(m: &MailMessage, s: string) <noret> {
+    free_str(m.html_body);
+    m.html_body = clone(s);
+}
+
+// Adds a TEXT attachment (content is text; it is base64-encoded at render
+// time). Binary content is NOT supported in v0.1.0 (see header notes).
+#[export]
+pub fun mail_attach(m: &MailMessage, filename: string, content_type: string, content: string) <noret> {
+    m.att_names.push(clone(filename));
+    m.att_types.push(clone(content_type));
+    m.att_contents.push(clone(content));
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+fun m_render_err(msg: string) <MailRender> {
+    return MailRender{ok: false, text: "", err: clone(msg)};
+}
+
+#[export]
+pub fun mail_free_render(r: &MailRender) <noret> {
+    if (r.ok) {
+        free_str(r.text);
+    } else {
+        free_str(r.err);
+    }
+}
+
+fun m_part_text(body: string) <string> {
+    let norm <string> = m_normalize_crlf(body);
+    let head <string> = "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n";
+    let out <string> = concat(head, norm);
+    free_str(norm);
+    return out;
+}
+
+fun m_part_html(body: string) <string> {
+    let norm <string> = m_normalize_crlf(body);
+    let head <string> = "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n";
+    let out <string> = concat(head, norm);
+    free_str(norm);
+    return out;
+}
+
+// Full multipart/alternative body (no outer Content-Type header).
+fun m_alternative_block(text_body: string, html_body: string, boundary: string) <string> {
+    let buf <&MBuf> = m_buf_new();
+    m_buf_append_str(buf, "--");
+    m_buf_append_str(buf, boundary);
+    m_buf_append_str(buf, "\r\n");
+    let tp <string> = m_part_text(text_body);
+    m_buf_append_str(buf, tp);
+    free_str(tp);
+    m_buf_append_str(buf, "\r\n--");
+    m_buf_append_str(buf, boundary);
+    m_buf_append_str(buf, "\r\n");
+    let hp <string> = m_part_html(html_body);
+    m_buf_append_str(buf, hp);
+    free_str(hp);
+    m_buf_append_str(buf, "\r\n--");
+    m_buf_append_str(buf, boundary);
+    m_buf_append_str(buf, "--");
+    let out <string> = m_buf_to_string(buf);
+    m_buf_free(buf);
+    return out;
+}
+
+// Renders the message to a full RFC 5322 / MIME text (CRLF line endings,
+// trailing CRLF). Validation failures return ok=false with a heap err.
+#[export]
+pub fun mail_render(m: &MailMessage) <MailRender> {
+    if (!mail_valid_address(m.sender)) {
+        return m_render_err("invalid From address");
+    }
+    let nrec <int> = m.to.len() + m.cc.len() + m.bcc.len();
+    if (nrec <= 0) {
+        return m_render_err("no recipients (add at least one To, Cc, or Bcc)");
+    }
+    let nall <int> = m.to.len();
+    for (let i <int> = 0; i < nall; i++) {
+        if (!mail_valid_address(m.to.get(i))) { return m_render_err("invalid To address"); }
+    }
+    nall = m.cc.len();
+    for (let i <int> = 0; i < nall; i++) {
+        if (!mail_valid_address(m.cc.get(i))) { return m_render_err("invalid Cc address"); }
+    }
+    nall = m.bcc.len();
+    for (let i <int> = 0; i < nall; i++) {
+        if (!mail_valid_address(m.bcc.get(i))) { return m_render_err("invalid Bcc address"); }
+    }
+    if (!m_no_crlf(m.subject)) {
+        return m_render_err("subject must not contain CR or LF");
+    }
+    let natt <int> = m.att_names.len();
+    for (let i <int> = 0; i < natt; i++) {
+        if (!m_no_crlf(m.att_names.get(i))) {
+            return m_render_err("attachment filename must not contain CR or LF");
+        }
+    }
+    // Boundary from wall-clock seconds; collision-checked below.
+    let epoch <string> = m_ltoa(now());
+    let boundary <string> = concat("fin-mail-", epoch);
+    free_str(epoch);
+    let boundary_mixed <string> = concat(boundary, "-mixed");
+    if (contains(m.text_body, boundary) || contains(m.html_body, boundary)) {
+        free_str(boundary);
+        free_str(boundary_mixed);
+        return m_render_err("message body contains the MIME boundary");
+    }
+    for (let i <int> = 0; i < natt; i++) {
+        if (contains(m.att_contents.get(i), boundary)) {
+            free_str(boundary);
+            free_str(boundary_mixed);
+            return m_render_err("attachment content contains the MIME boundary");
+        }
+    }
+    let has_html <bool> = len(m.html_body) > 0;
+    let buf <&MBuf> = m_buf_new();
+    m_buf_append_str(buf, "From: ");
+    m_buf_append_str(buf, m.sender);
+    m_buf_append_str(buf, "\r\n");
+    if (m.to.len() > 0) {
+        let joined <string> = join(m.to, ", ");
+        m_buf_append_str(buf, "To: ");
+        m_buf_append_str(buf, joined);
+        m_buf_append_str(buf, "\r\n");
+        free_str(joined);
+    }
+    if (m.cc.len() > 0) {
+        let joined <string> = join(m.cc, ", ");
+        m_buf_append_str(buf, "Cc: ");
+        m_buf_append_str(buf, joined);
+        m_buf_append_str(buf, "\r\n");
+        free_str(joined);
+    }
+    // Bcc intentionally has NO header: envelope-only recipients below.
+    m_buf_append_str(buf, "Subject: ");
+    m_buf_append_str(buf, m.subject);
+    m_buf_append_str(buf, "\r\n");
+    m_buf_append_str(buf, "MIME-Version: 1.0\r\n");
+    if (natt == 0 && !has_html) {
+        m_buf_append_str(buf, "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
+        let norm <string> = m_normalize_crlf(m.text_body);
+        m_buf_append_str(buf, norm);
+        free_str(norm);
+        m_buf_append_str(buf, "\r\n");
+    } else if (natt == 0) {
+        m_buf_append_str(buf, "Content-Type: multipart/alternative; boundary=\"");
+        m_buf_append_str(buf, boundary);
+        m_buf_append_str(buf, "\"\r\n\r\n");
+        let alt <string> = m_alternative_block(m.text_body, m.html_body, boundary);
+        m_buf_append_str(buf, alt);
+        free_str(alt);
+        m_buf_append_str(buf, "\r\n");
+    } else {
+        m_buf_append_str(buf, "Content-Type: multipart/mixed; boundary=\"");
+        m_buf_append_str(buf, boundary_mixed);
+        m_buf_append_str(buf, "\"\r\n\r\n");
+        m_buf_append_str(buf, "--");
+        m_buf_append_str(buf, boundary_mixed);
+        m_buf_append_str(buf, "\r\n");
+        if (has_html) {
+            m_buf_append_str(buf, "Content-Type: multipart/alternative; boundary=\"");
+            m_buf_append_str(buf, boundary);
+            m_buf_append_str(buf, "\"\r\n\r\n");
+            let alt <string> = m_alternative_block(m.text_body, m.html_body, boundary);
+            m_buf_append_str(buf, alt);
+            free_str(alt);
+            m_buf_append_str(buf, "\r\n");
+        } else {
+            let tp <string> = m_part_text(m.text_body);
+            m_buf_append_str(buf, tp);
+            free_str(tp);
+            m_buf_append_str(buf, "\r\n");
+        }
+        for (let i <int> = 0; i < natt; i++) {
+            m_buf_append_str(buf, "--");
+            m_buf_append_str(buf, boundary_mixed);
+            m_buf_append_str(buf, "\r\n");
+            m_buf_append_str(buf, "Content-Type: ");
+            m_buf_append_str(buf, m.att_types.get(i));
+            m_buf_append_str(buf, "; name=\"");
+            m_buf_append_str(buf, m.att_names.get(i));
+            m_buf_append_str(buf, "\"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"");
+            m_buf_append_str(buf, m.att_names.get(i));
+            m_buf_append_str(buf, "\"\r\n\r\n");
+            let raw <string> = base64_encode(m.att_contents.get(i));
+            let wrapped <string> = m_wrap76(raw);
+            free_encoded(raw);
+            m_buf_append_str(buf, wrapped);
+            free_str(wrapped);
+            m_buf_append_str(buf, "\r\n");
+        }
+        m_buf_append_str(buf, "--");
+        m_buf_append_str(buf, boundary_mixed);
+        m_buf_append_str(buf, "--\r\n");
+    }
+    free_str(boundary);
+    free_str(boundary_mixed);
+    let out <string> = m_buf_to_string(buf);
+    m_buf_free(buf);
+    return MailRender{ok: true, text: out, err: ""};
+}
+
+// ---------------------------------------------------------------------------
+// Internal: TCP plumbing (same shape as zhttp; dotted quads only, no DNS)
+// ---------------------------------------------------------------------------
+
+fun m_sockaddr(host: string, port: int) <[int]> {
+    let a <int> = m_inet_addr(host);
+    blame a != -1, "cannot parse the address as a dotted quad";
+    let addr <[int]> = new [int, 4]{};
+    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 +
+                        cast<long>(port % 256) * 16777216);
+    addr[1] = a;
+    return addr;
+}
+
+// Returns a connected fd, or -1 on any failure (never blames).
+fun m_dial(host: string, port: int) <int> {
+    if (port <= 0 || port > 65535) { return -1; }
+    let a <int> = m_inet_addr(host);
+    if (a == -1) { return -1; }
+    let addr <[int]> = m_sockaddr(host, port);
+    let fd <int> = m_socket(2, 1, 0);
+    if (fd < 0) { delete addr; return -1; }
+    let err <int> = m_connect(fd, &addr[0], 16);
+    delete addr;
+    if (err != 0) { m_close(fd); return -1; }
+    return fd;
+}
+
+fun m_send_all(fd: int, bytes: [char], n: int) <bool> {
+    let sent <int> = 0;
+    while (sent < n) {
+        let got <int> = m_send(fd, &bytes[sent], n - sent, 0);
+        if (got <= 0) { return false; }
+        sent = sent + got;
+    }
+    return true;
+}
+
+fun m_send_str(fd: int, s: string) <bool> {
+    let bytes <[char]> = to_chars(s);
+    let ok <bool> = m_send_all(fd, bytes, len(s));
+    delete bytes;
+    return ok;
+}
+
+// Reads one SMTP reply: consumes continuation lines (code followed by '-')
+// until the final line (code followed by ' '). Returns the numeric code,
+// or -1 on EOF, read error, malformed reply, or absurd size (>64 lines,
+// >4096 chars per line).
+fun m_read_reply(fd: int) <int> {
+    let lines <int> = 0;
+    let code <int> = -1;
+    let buf <&MBuf> = m_buf_new();
+    while (true) {
+        let chunk <[char]> = new [char, 2]{};
+        let got <int> = m_recv(fd, &chunk[0], 1, 0);
+        if (got <= 0) {
+            delete chunk;
+            m_buf_free(buf);
+            return -1;
+        }
+        let c <char> = chunk[0];
+        delete chunk;
+        if (c == '\n') {
+            lines = lines + 1;
+            if (lines > 64) {
+                m_buf_free(buf);
+                return -1;
+            }
+            let linelen <int> = buf.len;
+            if (linelen > 0 && buf.data[linelen - 1] == '\r') {
+                linelen = linelen - 1;
+            }
+            if (linelen < 3) {
+                m_buf_free(buf);
+                return -1;
+            }
+            let d0 <char> = buf.data[0];
+            let d1 <char> = buf.data[1];
+            let d2 <char> = buf.data[2];
+            if (!m_is_digit(d0) || !m_is_digit(d1) || !m_is_digit(d2)) {
+                m_buf_free(buf);
+                return -1;
+            }
+            code = (cast<int>(d0) - cast<int>('0')) * 100 +
+                   (cast<int>(d1) - cast<int>('0')) * 10 +
+                   (cast<int>(d2) - cast<int>('0'));
+            if (linelen >= 4 && buf.data[3] == '-') {
+                buf.len = 0;
+            } else {
+                m_buf_free(buf);
+                return code;
+            }
+        } else {
+            if (buf.len > 4096) {
+                m_buf_free(buf);
+                return -1;
+            }
+            m_buf_push(buf, c);
+        }
+    }
+    m_buf_free(buf);
+    return -1;
+}
+
+// Sends one SMTP command line (without CRLF; added here) and reads the
+// reply code. -1 when the send or the read fails.
+fun m_command(fd: int, cmd: string) <int> {
+    let line <string> = concat(cmd, "\r\n");
+    let ok <bool> = m_send_str(fd, line);
+    free_str(line);
+    if (!ok) { return -1; }
+    return m_read_reply(fd);
+}
+
+fun m_result_err(msg: string) <MailResult> {
+    return MailResult{ok: false, code: 0, err: clone(msg)};
+}
+
+fun m_result_code_err(msg: string, code: int) <MailResult> {
+    let codestr <string> = m_itoa(code);
+    let full <string> = concat(concat(msg, " (code "), concat(codestr, ")"));
+    free_str(codestr);
+    return MailResult{ok: false, code: code, err: full};
+}
+
+#[export]
+pub fun mail_free_result(r: &MailResult) <noret> {
+    if (!r.ok) { free_str(r.err); }
+}
+
+// ---------------------------------------------------------------------------
+// Sending
+// ---------------------------------------------------------------------------
+
+// Full send session shared by mail_send / mail_send_auth. When use_auth is
+// true, AUTH LOGIN runs after EHLO/HELO. The rendered message is
+// dot-stuffed on the wire; the caller's message is untouched.
+fun m_send_session(host: string, port: int, m: &MailMessage, use_auth: bool, user: string, pass: string) <MailResult> {
+    let rendered <MailRender> = mail_render(m);
+    if (!rendered.ok) {
+        return MailResult{ok: false, code: 0, err: rendered.err};
+    }
+    let fd <int> = m_dial(host, port);
+    if (fd < 0) {
+        free_str(rendered.text);
+        return m_result_err("cannot connect to SMTP server");
+    }
+    let code <int> = m_read_reply(fd);
+    if (code != 220) {
+        m_close(fd);
+        free_str(rendered.text);
+        return m_result_code_err("bad SMTP greeting", code);
+    }
+    code = m_command(fd, "EHLO localhost");
+    if (code != 250) {
+        code = m_command(fd, "HELO localhost");
+        if (code != 250) {
+            m_close(fd);
+            free_str(rendered.text);
+            return m_result_code_err("EHLO/HELO rejected", code);
+        }
+    }
+    if (use_auth) {
+        code = m_command(fd, "AUTH LOGIN");
+        if (code != 334) {
+            m_close(fd);
+            free_str(rendered.text);
+            return m_result_code_err("AUTH LOGIN not accepted", code);
+        }
+        let ub64 <string> = base64_encode(user);
+        code = m_command(fd, ub64);
+        free_encoded(ub64);
+        if (code != 334) {
+            m_close(fd);
+            free_str(rendered.text);
+            return m_result_code_err("username not accepted", code);
+        }
+        let pb64 <string> = base64_encode(pass);
+        code = m_command(fd, pb64);
+        free_encoded(pb64);
+        if (code != 235) {
+            m_close(fd);
+            free_str(rendered.text);
+            return m_result_code_err("authentication failed", code);
+        }
+    }
+    let cmd <string> = concat(concat("MAIL FROM:<", m.sender), ">");
+    code = m_command(fd, cmd);
+    free_str(cmd);
+    if (code != 250) {
+        m_close(fd);
+        free_str(rendered.text);
+        return m_result_code_err("MAIL FROM rejected", code);
+    }
+    let all_ok <bool> = true;
+    let nrec <int> = m.to.len();
+    for (let i <int> = 0; i < nrec; i++) {
+        let rcpt <string> = concat(concat("RCPT TO:<", m.to.get(i)), ">");
+        code = m_command(fd, rcpt);
+        free_str(rcpt);
+        if (code != 250 && code != 251) { all_ok = false; }
+    }
+    nrec = m.cc.len();
+    for (let i <int> = 0; i < nrec; i++) {
+        let rcpt <string> = concat(concat("RCPT TO:<", m.cc.get(i)), ">");
+        code = m_command(fd, rcpt);
+        free_str(rcpt);
+        if (code != 250 && code != 251) { all_ok = false; }
+    }
+    nrec = m.bcc.len();
+    for (let i <int> = 0; i < nrec; i++) {
+        let rcpt <string> = concat(concat("RCPT TO:<", m.bcc.get(i)), ">");
+        code = m_command(fd, rcpt);
+        free_str(rcpt);
+        if (code != 250 && code != 251) { all_ok = false; }
+    }
+    if (!all_ok) {
+        m_close(fd);
+        free_str(rendered.text);
+        return m_result_code_err("recipient rejected", code);
+    }
+    code = m_command(fd, "DATA");
+    if (code != 354) {
+        m_close(fd);
+        free_str(rendered.text);
+        return m_result_code_err("DATA not accepted", code);
+    }
+    // Dot-stuff: a '.' at the start of a line is doubled on the wire.
+    let stuffed <&MBuf> = m_buf_new();
+    let chars <[char]> = to_chars(rendered.text);
+    let total <int> = len(rendered.text);
+    for (let i <int> = 0; i < total; i++) {
+        let at_start <bool> = false;
+        if (i == 0) { at_start = true; }
+        if (i > 0 && chars[i - 1] == '\n') { at_start = true; }
+        if (at_start && chars[i] == '.') { m_buf_push(stuffed, '.'); }
+        m_buf_push(stuffed, chars[i]);
+    }
+    delete chars;
+    free_str(rendered.text);
+    let sent <bool> = m_send_all(fd, stuffed.data, stuffed.len);
+    m_buf_free(stuffed);
+    if (!sent) {
+        m_close(fd);
+        return m_result_err("failed sending message data");
+    }
+    code = m_command(fd, ".");
+    if (code != 250) {
+        m_close(fd);
+        return m_result_code_err("message not accepted", code);
+    }
+    // Best effort: QUIT, ignore its reply, close.
+    m_send_str(fd, "QUIT\r\n");
+    m_close(fd);
+    return MailResult{ok: true, code: 250, err: ""};
+}
+
+// Sends the message via a plain SMTP server (no auth). Host must be a
+// dotted quad (no DNS in v0.1.0); port is usually 25 or 1025/8025 for
+// local test sinks. Never blame-fails on server errors: check `ok`.
+#[export]
+pub fun mail_send(host: string, port: int, m: &MailMessage) <MailResult> {
+    return m_send_session(host, port, m, false, "", "");
+}
+
+// Same as mail_send, but authenticates with AUTH LOGIN first. Only for
+// trusted servers: credentials travel base64-encoded (plaintext).
+#[export]
+pub fun mail_send_auth(host: string, port: int, user: string, pass: string, m: &MailMessage) <MailResult> {
+    return m_send_session(host, port, m, true, user, pass);
+}
+
+} // namespace fin
